@@ -79,7 +79,7 @@ def deconvolve_excel_mixture(df, tol=0.15):
         .fillna("")
         .astype(str)
         .str.strip()
-        .replace({"nan": "", "None": ""})
+        .replace({"nan": "", "None": "", "Unknown_Sample": "", "Unknown": ""})
     )
     work_df["Integral"] = pd.to_numeric(work_df["Integral"], errors="coerce")
 
