@@ -341,6 +341,18 @@ def split_df_by_compound_ids(df, cid_units, cid_col="Compound_ID", tol=0.06):
         for cid, rows in rows_by_cid.items()
         if rows
     }
+    compounds_dict = {}
+    for cid, rows in rows_by_cid.items():
+        if not rows:
+            continue
+        comp_df = pd.DataFrame(rows).reset_index(drop=True)
+        unit_val = float(cid_units[cid])
+        if unit_val > 0:
+            comp_df["Integral"] = (
+                pd.to_numeric(comp_df["Integral"], errors="coerce").fillna(0.0) / unit_val
+            ).round(4)
+        compounds_dict[cid] = comp_df
+
     return compounds_dict
 
 
