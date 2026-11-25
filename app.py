@@ -208,7 +208,8 @@ def deconvolve_excel_mixture(df, tol=0.15):
         "Auto_Minor": pd.DataFrame(rows_minor),
     }
 def extract_spectroscopic_features(compound_df):
-    """Extract 1H NMR spin-system features for trans-alkene, AA'BB' (coumaric), and ABX (caffeic).
+    """Extract 1H NMR spin-system features for trans-alkene, AA'BB' (coumaric), ABX (caffeic),
+    and 4-state midfield (4.3-5.5 ppm) classification.
     Window 5.3-9.2 ppm matches the augmented training pipeline in main.py."""
     trans_peak_count = 0.0      # Rule 1: Peaks with J > 13 Hz (trans-alkene)
     trans_int_sum = 0.0         # Rule 1: Total integral of trans-alkene peaks
@@ -220,14 +221,22 @@ def extract_spectroscopic_features(compound_df):
     abx_ortho_meta_1h = 0.0     # Rule 3c: 1H aromatic peak with BOTH J = 8-9 Hz and J = 1-3 Hz
 
     arom_4h_singlet_int = 0.0   # Symmetric hydroquinone 4H singlet/narrow multiplet
-    total_ortho_doublets = 0.0 # All aromatic peaks with J = 8-9 Hz
+    total_ortho_doublets = 0.0  # All aromatic peaks with J = 8-9 Hz
+
+    # 4-state midfield (4.3-5.5 ppm) trackers
     anomeric_peaks = 0
     anomeric_h = 0.0
-    j_cols = [c for c in compound_df.columns if str(c).lower().startswith('j') and any(ch.isdigit() for ch in str(c))]
+    c6_ch2_peaks = []
+    methoxy_peaks = []
+    solvent_obscured_peaks = []
+    bypass_sugar_filter = False
+
+    j_cols = [
+        c for c in compound_df.columns
+        if str(c).lower().startswith('j') and any(ch.isdigit() for ch in str(c))
+    ]
 
     for _, row in compound_df.iterrows():
-        if pd.to_numeric(row.get('Solvent_Overlap', 0), errors='coerce') == 1:
-            continue
         ppm = pd.to_numeric(row.get('Shift_ppm'), errors='coerce')
         if pd.isna(ppm):
             continue
@@ -238,16 +247,35 @@ def extract_spectroscopic_features(compound_df):
             if pd.notna(val) and val >= 0.5:
                 raw_js.append(float(val))
         row_js = sorted(raw_js, reverse=True)
+        n_j = len(row_js)
         max_j = row_js[0] if row_js else 0.0
 
+        is_solvent_ov = (pd.to_numeric(row.get('Solvent_Overlap', 0), errors='coerce') == 1)
         is_mix = (pd.to_numeric(row.get('Mixture_Overlap', 0), errors='coerce') == 1)
         raw_int = pd.to_numeric(row.get('Integral', 0), errors='coerce')
         eff_int = 1.0 if is_mix else (float(raw_int) if pd.notna(raw_int) else 0.0)
 
-        # Quy luật Anomeric Proton (4.3–5.5 ppm, 1 giá trị J, J < 11.5 Hz)
-        if 4.3 <= ppm <= 5.5 and len(row_js) == 1 and row_js[0] < 11.5:
-            anomeric_peaks += 1
-            anomeric_h += eff_int
+        # Midfield 4-state classification (4.3-5.5 ppm)
+        if 4.3 <= ppm <= 5.5:
+            # State 4: Solvent-obscured peak (Solvent_Overlap == 1 and N_J == 0)
+            if is_solvent_ov and n_j == 0:
+                solvent_obscured_peaks.append((float(ppm), eff_int))
+                bypass_sugar_filter = True
+                continue
+            # State 1: Confirmed Anomeric Proton (N_J == 1 and J1 < 11.0 Hz)
+            elif (not is_solvent_ov) and n_j == 1 and max_j < 11.0:
+                anomeric_peaks += 1
+                anomeric_h += eff_int
+            # State 2: Confirmed Acylated C6-CH2 (N_J >= 2 or J1 >= 11.0 Hz)
+            elif (not is_solvent_ov) and (n_j >= 2 or max_j >= 11.0):
+                c6_ch2_peaks.append((float(ppm), eff_int, row_js))
+            # State 3: Methoxy group -OCH3 (N_J == 0 and Integral ≈ 3H)
+            elif (not is_solvent_ov) and n_j == 0 and (2.5 <= eff_int <= 3.5):
+                methoxy_peaks.append((float(ppm), eff_int))
+
+        # Skip solvent-overlapped peaks for aromatic/olefinic spin-system rules
+        if is_solvent_ov:
+            continue
 
         # Rule 1: Trans-olefinic double bond (J > 13 Hz in 5.3-9.2 ppm)
         if 5.3 <= ppm <= 9.2 and max_j > 13.0:
@@ -303,6 +331,7 @@ def extract_spectroscopic_features(compound_df):
     else:
         caffeic_motif_score = 0.0
 
+    # Keep exact 14 features to match the trained 858-feature Random Forest model
     domain_vec = np.array([
         trans_peak_count,
         trans_int_sum,
@@ -329,7 +358,14 @@ def extract_spectroscopic_features(compound_df):
         'abx_meta_1h': int(abx_meta_only_1h),
         'abx_dd_1h': int(abx_ortho_meta_1h),
         'abx_score': int(abx_triad_completeness),
-        'has_full_abx': bool(has_full_abx == 1.0)
+        'has_full_abx': bool(has_full_abx == 1.0),
+        # 4-state midfield outputs for Stage 1 & Stage 2
+        'anomeric_peaks': anomeric_peaks,
+        'anomeric_h': anomeric_h,
+        'c6_ch2_peaks': c6_ch2_peaks,
+        'methoxy_peaks': methoxy_peaks,
+        'solvent_obscured_peaks': solvent_obscured_peaks,
+        'bypass_sugar_filter': bypass_sugar_filter,
     }
     return domain_vec, domain_info
 
@@ -580,12 +616,14 @@ def select_modules_by_threshold(rf_model, module_names, proba_list, threshold=70
 
 AROMATIC_H_MAP = {'hydroquinone': 4.0, 'caffeic': 5.0, 'coumaric': 6.0}
 
-def apply_stoichiometric_filter(module_counts, module_confidences, reg_feats):
+def apply_stoichiometric_filter(module_counts, module_confidences, reg_feats, bypass_sugar_filter=False):
     aromatic_int, anomeric_int, sugar_body_int, _ = reg_feats
     filtered = dict(module_counts)
     adjustments = []
 
-    if filtered.get('bglc', 0) > 0:
+    if bypass_sugar_filter:
+        adjustments.append("Bypassed sugar trimming filter (solvent-obscured peak in 4.3–5.5 ppm with N_J=0)")
+    elif filtered.get('bglc', 0) > 0:
         max_glc = int(round(anomeric_int)) if anomeric_int >= 0.5 else int(round(sugar_body_int / 6.0))
         if filtered['bglc'] > max_glc:
             adjustments.append(f"bglc: {filtered['bglc']}x → {max_glc}x (Anomeric: {anomeric_int:.1f}H, Sugar Body: {sugar_body_int:.1f}H)")
@@ -606,6 +644,130 @@ def apply_stoichiometric_filter(module_counts, module_confidences, reg_feats):
             adjustments.append(f"{m_name}: {orig_cnt}x → {allowed}x (Aromatic budget: {aromatic_int:.1f}H)")
             filtered[m_name] = allowed
     return filtered, adjustments
+from itertools import combinations_with_replacement
+
+
+def resolve_solvent_obscured_hypotheses(
+    base_counts,
+    module_confs,
+    module_names,
+    domain_info,
+    reg_feats,
+    calc_mw_fn,
+    active_mw=None,
+    mw_tol=2.0,
+):
+    """
+    Resolve solvent-obscured peaks (Solvent_Overlap == 1, N_J == 0 in 4.3-5.5 ppm)
+    using a clean baseline M_clean locked to confirmed clean anomeric H (N_J == 1, J < 11.0 Hz).
+
+    Preserves all anomeric rules:
+      - Lower bound ALWAYS enforced: total sugar units >= true_anomeric_h.
+      - Avoids double-counting sugars already predicted by RF when upper bound was bypassed.
+      - Evaluates all 3 physical assignments (Acylated C6-CH2, Anomeric, Methoxy) per obscured peak.
+      - Without MW: keeps RF prediction (base_counts) and exposes all hypotheses.
+      - With MW: filters hypotheses by exact MW tolerance and returns the best match.
+    """
+    obscured_peaks = domain_info.get("solvent_obscured_peaks", [])
+    if not obscured_peaks:
+        return base_counts, []
+
+    SUGAR_KEYWORDS = ("glc", "gal", "man", "ara", "xyl", "rha", "fru", "sugar")
+    METHOXY_KEYWORDS = ("ome", "methoxy", "och3", "methyl")
+
+    all_sugar_mods = [m for m in module_names if any(k in m.lower() for k in SUGAR_KEYWORDS)]
+    best_sugar = max(all_sugar_mods, key=lambda x: module_confs.get(x, 0.0)) if all_sugar_mods else None
+
+    methoxy_mods = [m for m in module_names if any(k in m.lower() for k in METHOXY_KEYWORDS)]
+    best_methoxy = max(methoxy_mods, key=lambda x: module_confs.get(x, 0.0)) if methoxy_mods else None
+
+    # 1. Build clean baseline M_clean locked strictly to confirmed clean anomeric H
+    true_anomeric_h = int(round(domain_info.get("anomeric_h", reg_feats[1])))
+    clean_counts = dict(base_counts)
+    current_sugars = sum(clean_counts.get(m, 0) for m in all_sugar_mods)
+    trimmed_sugars = []  # Preserve RF's original sugar identities if trimmed down to M_clean
+
+    if current_sugars < true_anomeric_h and best_sugar is not None:
+        # Enforce Lower Bound on M_clean
+        clean_counts[best_sugar] = clean_counts.get(best_sugar, 0) + (true_anomeric_h - current_sugars)
+    elif current_sugars > true_anomeric_h:
+        # Temporarily trim excess sugars (lowest RF confidence first) to prevent double-counting
+        excess = current_sugars - true_anomeric_h
+        active_sugars = [m for m in all_sugar_mods if clean_counts.get(m, 0) > 0]
+        for m in sorted(active_sugars, key=lambda x: module_confs.get(x, 0.0)):
+            while clean_counts.get(m, 0) > 0 and excess > 0:
+                clean_counts[m] -= 1
+                trimmed_sugars.append(m)
+                excess -= 1
+        # Reverse so highest-confidence trimmed sugars are restored first in Anomeric hypotheses
+        trimmed_sugars.reverse()
+
+    # 2. Generate all unique combinations of the 3 states across obscured peaks (cap at 3 peaks)
+    n_obscured = min(len(obscured_peaks), 3)
+    states = ("C6-CH2", "Anomeric", "Methoxy")
+    hypotheses = []
+
+    for combo in combinations_with_replacement(states, n_obscured):
+        n_c6 = combo.count("C6-CH2")
+        n_anom = combo.count("Anomeric")
+        n_ome = combo.count("Methoxy")
+
+        # Skip Anomeric hypotheses if the model has no sugar modules defined
+        if n_anom > 0 and best_sugar is None:
+            continue
+
+        h_counts = dict(clean_counts)
+
+        # Add Anomeric sugar units (restore RF-trimmed sugars first, then best_sugar)
+        for i in range(n_anom):
+            sugar_to_add = trimmed_sugars[i] if i < len(trimmed_sugars) else best_sugar
+            h_counts[sugar_to_add] = h_counts.get(sugar_to_add, 0) + 1
+
+        # Add Methoxy units (either as explicit module or +14.0157 Da O-methylation delta)
+        extra_ome_mass = 0.0
+        if n_ome > 0:
+            if best_methoxy is not None:
+                h_counts[best_methoxy] = h_counts.get(best_methoxy, 0) + n_ome
+            else:
+                extra_ome_mass = 14.0157 * n_ome
+
+        est_mw = float(calc_mw_fn(h_counts)) + extra_ome_mass
+
+        parts = []
+        if n_c6:
+            parts.append(f"{n_c6}x Acylated C6-CH2")
+        if n_anom:
+            parts.append(f"{n_anom}x Anomeric (+{n_anom} sugar)")
+        if n_ome:
+            parts.append(f"{n_ome}x Methoxy (-OCH3)")
+        label = " + ".join(parts)
+
+        total_h_sugars = sum(h_counts.get(m, 0) for m in all_sugar_mods)
+        hypotheses.append({
+            "label": label,
+            "counts": h_counts,
+            "est_mw": est_mw,
+            "n_c6": n_c6,
+            "n_anom": n_anom,
+            "n_ome": n_ome,
+            "note": (
+                f"Total sugars = {total_h_sugars} "
+                f"(clean anomeric: {true_anomeric_h} + obscured anomeric: {n_anom})."
+            ),
+        })
+
+    # 3. Arbitration by Molecular Weight
+    # Case A: No MW provided -> keep RF prediction (base_counts, already lower-bound protected)
+    if active_mw is None or active_mw <= 0:
+        return base_counts, hypotheses
+
+    # Case B: MW provided -> filter hypotheses within tolerance and pick closest match
+    matched = [h for h in hypotheses if abs(h["est_mw"] - active_mw) <= mw_tol]
+    matched.sort(key=lambda h: abs(h["est_mw"] - active_mw))
+
+    if matched:
+        return matched[0]["counts"], matched
+    return base_counts, []
 def compute_overall_confidence(module_counts, module_confs, reg_feats, linkages):
     """Calculate a composite 0-100% confidence score for the predicted structure."""
     active = [m for m, c in module_counts.items() if c > 0]
@@ -1017,7 +1179,12 @@ if uploaded_file is not None:
         module_counts, module_confs, stage1_summary = select_modules_by_threshold(
             rf_model, module_names, proba_list, threshold=conf_threshold
         )
-        module_counts, adjustments = apply_stoichiometric_filter(module_counts, module_confs, reg_feats)
+        module_counts, adjustments = apply_stoichiometric_filter(
+            module_counts,
+            module_confs,
+            reg_feats,
+            bypass_sugar_filter=domain_info.get('bypass_sugar_filter', False)
+        )
 
         # Spectroscopic Motif Safeguard (Rules 1, 2, 3)
         expected_arom = sum(AROMATIC_H_MAP.get(m, 0.0) * cnt for m, cnt in module_counts.items())
@@ -1059,12 +1226,45 @@ if uploaded_file is not None:
         if 'MW' in compound_df.columns and pd.notna(compound_df['MW'].iloc[0]):
             active_mw = float(compound_df['MW'].iloc[0])
 
-        if active_mw > 0:
-            module_counts, mw_note, mw_matches = apply_mw_filter(
-                module_counts, rf_model, module_names, proba_list, active_mw, tol=mw_tolerance
-            )
-            if mw_note:
-                adjustments.append(mw_note)
+        # 1. Resolve solvent-obscured peaks (4.3–5.5 ppm) first
+            mw_matches = []
+            resolved_by_obscured = False
+            if domain_info.get("solvent_obscured_peaks"):
+                module_counts, mw_hypotheses = resolve_solvent_obscured_hypotheses(
+                    base_counts=module_counts,
+                    module_confs=module_confs,
+                    module_names=module_names,
+                    domain_info=domain_info,
+                    reg_feats=reg_feats,
+                    calc_mw_fn=calc_theoretical_mw,
+                    active_mw=active_mw,
+                    mw_tol=mw_tolerance,
+                )
+
+                if active_mw > 0 and mw_hypotheses:
+                    best_h = mw_hypotheses[0]
+                    resolved_by_obscured = True
+                    adjustments.append(
+                        f"MW Filter ({active_mw:.1f} Da) resolved solvent-obscured peak → "
+                        f"{best_h['label']} (Calc MW: {best_h['est_mw']:.1f} Da)"
+                    )
+                    st.success(
+                        f"MW Filter ({active_mw:.1f} Da) resolved solvent-obscured peak → "
+                        f"**{best_h['label']}** (Calc MW: {best_h['est_mw']:.1f} Da)"
+                    )
+                elif active_mw <= 0:
+                    with st.expander("Solvent-obscured peak (4.3–5.5 ppm): open hypotheses (enter MW to filter)", expanded=True):
+                        for h in mw_hypotheses:
+                            st.write(f"- **{h['label']}** (Est. MW: `{h['est_mw']:.1f} Da`): {h['note']}")
+
+            # 2. Fallback to standard MW filter if not already resolved above
+            if active_mw > 0 and not resolved_by_obscured:
+                module_counts, mw_note, mw_matches = apply_mw_filter(
+                    module_counts, rf_model, module_names, proba_list, active_mw, tol=mw_tolerance
+                )
+                if mw_note:
+                    adjustments.append(mw_note)
+
         # Sync final post-filter counts back to Stage 1 display table
         for row in stage1_summary:
             final_c = module_counts[row["Module"]]
