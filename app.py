@@ -296,14 +296,26 @@ def split_df_by_compound_ids(df, cid_units, cid_col="Compound_ID", tol=0.06):
     rows_by_cid = {cid: [] for cid in cid_units}
 
     for _, row in df.iterrows():
+        is_solv = (pd.to_numeric(row.get("Solvent_Overlap", 0), errors="coerce") == 1)
+        is_mix = (pd.to_numeric(row.get("Mixture_Overlap", 0), errors="coerce") == 1)
         raw_int = pd.to_numeric(row.get("Integral", np.nan), errors="coerce")
+        raw_cid = row.get(cid_col, None)
+        cid_str = str(raw_cid).strip() if pd.notna(raw_cid) else ""
+
+        # Case 0: Solvent-overlapped peak -> NEVER drop even if Integral is 0/NaN
+        if is_solv:
+            if cid_str in rows_by_cid:
+                rows_by_cid[cid_str].append(row.copy())
+            else:
+                for cid in rows_by_cid:
+                    r_copy = row.copy()
+                    r_copy[cid_col] = cid
+                    rows_by_cid[cid].append(r_copy)
+            continue
+
         if pd.isna(raw_int) or float(raw_int) <= 0:
             continue
         fval = float(raw_int)
-
-        is_mix = (pd.to_numeric(row.get("Mixture_Overlap", 0), errors="coerce") == 1)
-        raw_cid = row.get(cid_col, None)
-        cid_str = str(raw_cid).strip() if pd.notna(raw_cid) else ""
 
         # Case 1: Mixture peak -> decompose by Compound_ID units
         if is_mix:
