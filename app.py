@@ -233,7 +233,7 @@ def extract_units_by_compound_id(df, cid_col="Compound_ID"):
             continue
 
         cid = str(raw_cid).strip()
-        if not cid or cid.lower() in {"nan", "none", "mix", "mixture"}:
+        if not cid or cid.lower() in {"nan", "none", "mix", "mixture", "unknown", "unknown_sample", "unassigned"}:
             continue
 
         clean_by_cid.setdefault(cid, []).append(float(val))
@@ -291,7 +291,7 @@ def split_df_by_compound_ids(df, cid_units, cid_col="Compound_ID", tol=0.06):
     - Unlabeled non-mixture peaks are routed to the Compound_ID with the closest unit.
     """
     if not cid_units:
-        return {"Compound_1": df.copy()}
+        return {"Unknown_Sample": df.copy()}
 
     rows_by_cid = {cid: [] for cid in cid_units}
 
@@ -503,8 +503,7 @@ def extract_spectroscopic_features(compound_df):
         'methoxy_peaks': methoxy_peaks,
         'solvent_obscured_peaks': solvent_obscured_peaks,
         'bypass_sugar_filter': bypass_sugar_filter,
-        'mixture_decompositions': mixture_decompositions,
-        'clean_unit_info': clean_unit_info,
+
     }
     return domain_vec, domain_info
 
