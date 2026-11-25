@@ -17,15 +17,28 @@ st.set_page_config(page_title="¹H NMR Structure Predictor", layout="wide")
 def load_assets():
     model_bundle = joblib.load('nmr_rf_model.pkl')
     qm_database = joblib.load('qm_database.pkl')
+    raw_sugar_map = {}
+    if isinstance(model_bundle, dict) and isinstance(model_bundle.get('sugar_body_h_map'), dict):
+        raw_sugar_map = model_bundle['sugar_body_h_map']
+    elif isinstance(qm_database, dict) and isinstance(qm_database.get('sugar_body_h_map'), dict):
+        raw_sugar_map = qm_database['sugar_body_h_map']
+
+    sugar_body_h_map = {
+        str(k).strip().lower(): float(v)
+        for k, v in raw_sugar_map.items()
+        if pd.notna(v) and float(v) > 0
+    }
+    sugar_body_h_map.setdefault("bglc", 6.0)
     return (
         model_bundle['model'],
         model_bundle['module_names'],
         model_bundle.get('cv_accuracy', None),
-        qm_database
+        qm_database,
+        sugar_body_h_map,
     )
 
 try:
-    rf_model, module_names, cv_accuracy, qm_database = load_assets()
+    rf_model, module_names, cv_accuracy, qm_database, SUGAR_BODY_H_MAP = load_assets()
 except Exception as e:
     st.error(f"Could not load model files (`nmr_rf_model.pkl` / `qm_database.pkl`). Error: {e}")
     st.stop()
@@ -783,11 +796,16 @@ def select_modules_by_threshold(rf_model, module_names, proba_list, threshold=70
 
 AROMATIC_H_MAP = {'hydroquinone': 4.0, 'caffeic': 5.0, 'coumaric': 6.0}
 
-def apply_stoichiometric_filter(module_counts, module_confidences, reg_feats, bypass_sugar_filter=False, hq_2h_j89_signals=0):
+def apply_stoichiometric_filter(module_counts, module_confidences, reg_feats, bypass_sugar_filter=False, hq_2h_j89_signals=0, sugar_body_profiles=None):
 
     aromatic_int, anomeric_int, sugar_body_int, _ = reg_feats
     filtered = dict(module_counts)
     adjustments = []
+    profiles = {
+            str(k).strip().lower(): float(v)
+            for k, v in (sugar_body_profiles or {}).items()
+            if pd.notna(v) and float(v) > 0
+        }
 
     if bypass_sugar_filter:
         adjustments.append("Bypassed sugar trimming filter (solvent-obscured peak in 4.3–5.5 ppm with N_J=0)")
@@ -803,6 +821,22 @@ def apply_stoichiometric_filter(module_counts, module_confidences, reg_feats, by
         adjustments.append(
             f"hydroquinone: {orig_hq}x -> 0x (Requires 2 signals with J=8–9 Hz and ~2H each; found {hq_2h_j89_signals})"
         )
+
+    # Enforce upper bound per sugar module using Sugar Body (3.0–4.3 ppm) proton budget
+        sugar_body_tol = 1.5
+        if sugar_body_int > 0:
+            for sugar_name, sb_per_unit in profiles.items():
+                curr_cnt = filtered.get(sugar_name, 0)
+                if curr_cnt > 0 and sb_per_unit > 0:
+                    max_by_sugar_body = max(
+                        1, int((sugar_body_int + sugar_body_tol) // sb_per_unit)
+                    )
+                    if curr_cnt > max_by_sugar_body:
+                        filtered[sugar_name] = max_by_sugar_body
+                        adjustments.append(
+                            f"{sugar_name}: {curr_cnt}x -> {max_by_sugar_body}x "
+                            f"(Sugar Body cap: {sugar_body_int:.1f}H / ~{sb_per_unit:.1f}H per unit)"
+                        )
 
     arom_candidates = sorted(
         [(m, filtered[m], module_confidences.get(m, 0.0)) for m in AROMATIC_H_MAP if filtered.get(m, 0) > 0],
@@ -1363,6 +1397,7 @@ if uploaded_file is not None:
             reg_feats,
             bypass_sugar_filter=domain_info.get('bypass_sugar_filter', False),
             hq_2h_j89_signals=domain_info.get("hq_2h_j89_signals", 0),
+            sugar_body_profiles=SUGAR_BODY_H_MAP,
         )
 
         # Spectroscopic Motif Safeguard (Rules 1, 2, 3)
