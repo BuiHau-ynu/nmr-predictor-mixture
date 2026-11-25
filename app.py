@@ -396,6 +396,7 @@ def extract_spectroscopic_features(compound_df):
         c for c in compound_df.columns
         if str(c).lower().startswith('j') and any(ch.isdigit() for ch in str(c))
     ]
+    hq_2h_j89_signals = 0
     for _, row in compound_df.iterrows():
         ppm = pd.to_numeric(row.get('Shift_ppm'), errors='coerce')
         if pd.isna(ppm):
@@ -415,7 +416,10 @@ def extract_spectroscopic_features(compound_df):
         raw_int = pd.to_numeric(row.get('Integral', 0), errors='coerce')
         
         eff_int = 1.0 if is_mix else (float(raw_int) if pd.notna(raw_int) else 0.0)
-     
+
+        if any(8.0 <= j <= 9.0 for j in row_js) and (1.6 <= eff_int <= 2.5):
+            hq_2h_j89_signals += 1
+            
         # Midfield 4-state classification (4.3-5.5 ppm)
         if 4.3 <= ppm <= 5.5:
             # State 4: Solvent-obscured peak (Solvent_Overlap == 1 and N_J == 0)
@@ -515,6 +519,7 @@ def extract_spectroscopic_features(compound_df):
         'trans_int': trans_int_sum,
         'aabb_2h_doublets': int(aabb_2h_doublets),
         'aabb_pairs': int(aabb_pair_count),
+        'hq_2h_j89_signals': int(hq_2h_j89_signals),
         'abx_ortho_1h': int(abx_ortho_only_1h),
         'abx_meta_1h': int(abx_meta_only_1h),
         'abx_dd_1h': int(abx_ortho_meta_1h),
@@ -778,7 +783,8 @@ def select_modules_by_threshold(rf_model, module_names, proba_list, threshold=70
 
 AROMATIC_H_MAP = {'hydroquinone': 4.0, 'caffeic': 5.0, 'coumaric': 6.0}
 
-def apply_stoichiometric_filter(module_counts, module_confidences, reg_feats, bypass_sugar_filter=False):
+def apply_stoichiometric_filter(module_counts, module_confidences, reg_feats, bypass_sugar_filter=False, hq_2h_j89_signals=0):
+
     aromatic_int, anomeric_int, sugar_body_int, _ = reg_feats
     filtered = dict(module_counts)
     adjustments = []
@@ -790,6 +796,13 @@ def apply_stoichiometric_filter(module_counts, module_confidences, reg_feats, by
         if filtered['bglc'] > max_glc:
             adjustments.append(f"bglc: {filtered['bglc']}x → {max_glc}x (Anomeric: {anomeric_int:.1f}H, Sugar Body: {sugar_body_int:.1f}H)")
             filtered['bglc'] = max_glc
+
+    if filtered.get('hydroquinone', 0) > 0 and hq_2h_j89_signals < 2:
+        orig_hq = filtered['hydroquinone']
+        filtered['hydroquinone'] = 0
+        adjustments.append(
+            f"hydroquinone: {orig_hq}x -> 0x (Requires 2 signals with J=8–9 Hz and ~2H each; found {hq_2h_j89_signals})"
+        )
 
     arom_candidates = sorted(
         [(m, filtered[m], module_confidences.get(m, 0.0)) for m in AROMATIC_H_MAP if filtered.get(m, 0) > 0],
@@ -1348,7 +1361,8 @@ if uploaded_file is not None:
             module_counts,
             module_confs,
             reg_feats,
-            bypass_sugar_filter=domain_info.get('bypass_sugar_filter', False)
+            bypass_sugar_filter=domain_info.get('bypass_sugar_filter', False),
+            hq_2h_j89_signals=domain_info.get("hq_2h_j89_signals", 0),
         )
 
         # Spectroscopic Motif Safeguard (Rules 1, 2, 3)
