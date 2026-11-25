@@ -1202,15 +1202,28 @@ if uploaded_file is not None:
                 adjustments.append(
                     f"Auto-included caffeic (1x, {module_confs['caffeic']:.1f}%): trans-alkene J > 13 Hz ({domain_info['trans_peaks']} peaks) + ABX aromatic triad ({domain_info['abx_score']}/3 signals)"
                 )
-        # Anomeric Proton Safeguard: total sugar units cannot exceed true anomeric H (1 J-value, J < 11.5 Hz)
+        # Anomeric Proton Safeguard (Two-sided: Lower bound ALWAYS active; Upper bound bypassed if solvent-obscured)
         SUGAR_KEYWORDS = ('glc', 'gal', 'man', 'ara', 'xyl', 'rha', 'fru', 'sugar')
-        sugar_mods = [m for m in module_counts if any(k in m.lower() for k in SUGAR_KEYWORDS) and module_counts[m] > 0]
-        total_sugar_units = sum(module_counts[m] for m in sugar_mods)
-        true_anomeric_h = int(round(reg_feats[1]))
+        all_sugar_mods = [m for m in module_names if any(k in m.lower() for k in SUGAR_KEYWORDS)]
+        sugar_mods = [m for m in all_sugar_mods if module_counts.get(m, 0) > 0]
+        total_sugar_units = sum(module_counts.get(m, 0) for m in sugar_mods)
+        true_anomeric_h = int(round(domain_info.get('anomeric_h', reg_feats[1])))
 
-        if true_anomeric_h >= 1 and total_sugar_units > true_anomeric_h:
+        # 1. LOWER BOUND (Always active): Total sugar units >= confirmed clean anomeric H
+        if true_anomeric_h >= 1 and total_sugar_units < true_anomeric_h:
+            deficit = true_anomeric_h - total_sugar_units
+            if all_sugar_mods:
+                best_sugar = max(all_sugar_mods, key=lambda x: module_confs.get(x, 0.0))
+                old_cnt = module_counts.get(best_sugar, 0)
+                module_counts[best_sugar] = old_cnt + deficit
+                adjustments.append(
+                    f"Boosted {best_sugar} ({old_cnt}x → {module_counts[best_sugar]}x): "
+                    f"confirmed {true_anomeric_h} clean anomeric H in 4.3–5.5 ppm (RF predicted only {total_sugar_units})."
+                )
+
+        # 2. UPPER BOUND (Bypassed if solvent-obscured peak exists in 4.3–5.5 ppm)
+        elif (not domain_info.get('bypass_sugar_filter', False)) and true_anomeric_h >= 1 and total_sugar_units > true_anomeric_h:
             excess = total_sugar_units - true_anomeric_h
-            # Trim excess units starting from the sugar module with the lowest RF confidence
             for m in sorted(sugar_mods, key=lambda x: module_confs.get(x, 0.0)):
                 if excess <= 0:
                     break
@@ -1219,8 +1232,9 @@ if uploaded_file is not None:
                 module_counts[m] -= reduce_by
                 excess -= reduce_by
                 adjustments.append(
-                    f"Adjusted {m} ({old_cnt}x → {module_counts[m]}x): only {reg_feats[1]:.1f} H in 4.3–5.5 ppm matched anomeric rule (1 J-value, J < 11.5 Hz); remaining signals assigned to CH2."
+                    f"Adjusted {m} ({old_cnt}x → {module_counts[m]}x): only {true_anomeric_h} H in 4.3–5.5 ppm matched anomeric rule (1 J-value, J < 11.0 Hz); remaining signals assigned to CH2."
                 )
+
         # Molecular Weight Filter (reads optional 'MW' column in Excel, or falls back to Sidebar input)
         active_mw = target_mw_input
         if 'MW' in compound_df.columns and pd.notna(compound_df['MW'].iloc[0]):
