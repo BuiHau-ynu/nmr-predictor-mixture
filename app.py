@@ -207,6 +207,182 @@ def deconvolve_excel_mixture(df, tol=0.15):
         "Auto_Major": pd.DataFrame(rows_major),
         "Auto_Minor": pd.DataFrame(rows_minor),
     }
+def extract_component_units_from_clean_peaks(compound_df, cluster_tol=0.12):
+    """
+    Extract representative unit integrals purely from clean (non-overlapped) peaks:
+    Solvent_Overlap != 1 and Mixture_Overlap != 1.
+    No hardcoded 1.0 or 0.3 fallback.
+    """
+    clean_vals = []
+    for _, row in compound_df.iterrows():
+        is_solv = (pd.to_numeric(row.get("Solvent_Overlap", 0), errors="coerce") == 1)
+        is_mix = (pd.to_numeric(row.get("Mixture_Overlap", 0), errors="coerce") == 1)
+        val = pd.to_numeric(row.get("Integral", np.nan), errors="coerce")
+
+        if (not is_solv) and (not is_mix) and pd.notna(val) and float(val) > 0:
+            clean_vals.append(float(val))
+
+    if not clean_vals:
+        return None, None, {
+            "source": "no_clean_peaks",
+            "clean_peaks_used": [],
+            "clusters": [],
+        }
+
+    sorted_vals = sorted(clean_vals)
+    clusters = [[sorted_vals[0]]]
+    for v in sorted_vals[1:]:
+        cluster_med = float(np.median(clusters[-1]))
+        if abs(v - cluster_med) <= cluster_tol:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+
+    cluster_medians = [float(np.median(c)) for c in clusters]
+
+    # Highest clean cluster represents major component; lower separated cluster represents minor
+    major_val = max(cluster_medians)
+    lower_clusters = [m for m in cluster_medians if m < (major_val - cluster_tol)]
+    minor_val = max(lower_clusters) if lower_clusters else None
+
+    return major_val, minor_val, {
+        "source": "clean_peaks_only",
+        "clean_peaks_used": clean_vals,
+        "clusters": [round(m, 4) for m in cluster_medians],
+    }
+
+
+def decompose_mixture_integral(raw_int, major_val, minor_val=None, tol=0.06):
+    """
+    Decompose a mixture peak integral using unit values derived solely from clean peaks:
+      int ≈ k_major * major_val + k_minor * minor_val
+    """
+    val = float(raw_int) if raw_int is not None and not pd.isna(raw_int) else 0.0
+    if val <= 0 or major_val is None or major_val <= 0:
+        return val, {
+            "k_major": 0,
+            "k_minor": 0,
+            "major_val_used": major_val,
+            "minor_val_used": minor_val,
+            "matched": False,
+            "residual": None,
+            "theo_int": None,
+        }
+
+    maj_u = float(major_val)
+    has_minor = (minor_val is not None) and (float(minor_val) > 0)
+    min_u = float(minor_val) if has_minor else 0.0
+    minor_range = range(0, 6) if has_minor else [0]
+
+    candidates = []
+    for k_maj in range(0, 4):
+        for k_min in minor_range:
+            if k_maj == 0 and k_min == 0:
+                continue
+            theo = k_maj * maj_u + k_min * min_u
+            err = abs(val - theo)
+            penalty = err + 0.002 * (k_maj + k_min)
+            candidates.append((penalty, err, k_maj, k_min, theo))
+
+    candidates.sort(key=lambda x: x[0])
+    _, best_err, best_maj, best_min, best_theo = candidates[0]
+
+    ref_scale = min(maj_u, min_u) if has_minor else maj_u
+    eff_tol = max(tol, 0.15 * ref_scale)
+
+    if best_err <= eff_tol:
+        # Normalize to clean unit scale of the matched component(s)
+        if best_maj >= 1 and best_min == 0:
+            norm_int = maj_u
+        elif best_min >= 1 and best_maj == 0 and has_minor:
+            norm_int = min_u
+        elif best_maj >= 1:
+            norm_int = maj_u
+        else:
+            norm_int = min_u if has_minor else val
+
+        return norm_int, {
+            "k_major": best_maj,
+            "k_minor": best_min,
+            "major_val_used": round(maj_u, 4),
+            "minor_val_used": round(min_u, 4) if has_minor else None,
+            "matched": True,
+            "residual": round(best_err, 4),
+            "theo_int": round(best_theo, 4),
+        }
+
+    return val, {
+        "k_major": 0,
+        "k_minor": 0,
+        "major_val_used": round(maj_u, 4),
+        "minor_val_used": round(min_u, 4) if has_minor else None,
+        "matched": False,
+        "residual": round(best_err, 4),
+        "theo_int": None,
+    }
+
+
+def split_mixture_df_by_components(compound_df, major_val, minor_val=None, tol=0.06):
+    """
+    Split `compound_df` into `major_df` and `minor_df` using only clean-peak unit values.
+    """
+    if major_val is None or major_val <= 0:
+        return compound_df.copy(), compound_df.iloc[0:0].copy()
+
+    maj_u = float(major_val)
+    has_minor = (minor_val is not None) and (float(minor_val) > 0)
+    min_u = float(minor_val) if has_minor else None
+
+    major_rows = []
+    minor_rows = []
+
+    for _, row in compound_df.iterrows():
+        raw_int = pd.to_numeric(row.get("Integral", np.nan), errors="coerce")
+        if pd.isna(raw_int) or float(raw_int) <= 0:
+            continue
+        fval = float(raw_int)
+
+        is_mix = (pd.to_numeric(row.get("Mixture_Overlap", 0), errors="coerce") == 1)
+
+        if is_mix:
+            _, decomp = decompose_mixture_integral(
+                fval,
+                major_val=maj_u,
+                minor_val=min_u,
+                tol=tol,
+            )
+            k_maj = decomp.get("k_major", 0)
+            k_min = decomp.get("k_minor", 0)
+
+            if k_maj >= 1:
+                r_maj = row.copy()
+                r_maj["Mixture_Overlap"] = 0
+                r_maj["Integral"] = round(maj_u, 4)
+                major_rows.append(r_maj)
+
+            if k_min >= 1 and has_minor:
+                r_min = row.copy()
+                r_min["Mixture_Overlap"] = 0
+                r_min["Integral"] = round(min_u, 4)
+                minor_rows.append(r_min)
+
+            # If no clean-unit combination matched, keep raw peak in major branch without inventing 1.0/0.3
+            if k_maj == 0 and k_min == 0:
+                major_rows.append(row.copy())
+            continue
+
+        # Clean or solvent-only peak: assign by proximity to minor_val vs major_val
+        if has_minor and abs(fval - min_u) < abs(fval - maj_u):
+            minor_rows.append(row.copy())
+        else:
+            major_rows.append(row.copy())
+
+    major_df = pd.DataFrame(major_rows).reset_index(drop=True) if major_rows else compound_df.iloc[0:0].copy()
+    minor_df = pd.DataFrame(minor_rows).reset_index(drop=True) if minor_rows else compound_df.iloc[0:0].copy()
+
+    return major_df, minor_df
+
+
 def extract_spectroscopic_features(compound_df):
     """Extract 1H NMR spin-system features for trans-alkene, AA'BB' (coumaric), ABX (caffeic),
     and 4-state midfield (4.3-5.5 ppm) classification.
@@ -235,7 +411,8 @@ def extract_spectroscopic_features(compound_df):
         c for c in compound_df.columns
         if str(c).lower().startswith('j') and any(ch.isdigit() for ch in str(c))
     ]
-
+    major_unit, minor_unit, clean_unit_info = extract_component_units_from_clean_peaks(compound_df)
+    mixture_decompositions = []
     for _, row in compound_df.iterrows():
         ppm = pd.to_numeric(row.get('Shift_ppm'), errors='coerce')
         if pd.isna(ppm):
@@ -253,8 +430,23 @@ def extract_spectroscopic_features(compound_df):
         is_solvent_ov = (pd.to_numeric(row.get('Solvent_Overlap', 0), errors='coerce') == 1)
         is_mix = (pd.to_numeric(row.get('Mixture_Overlap', 0), errors='coerce') == 1)
         raw_int = pd.to_numeric(row.get('Integral', 0), errors='coerce')
-        eff_int = 1.0 if is_mix else (float(raw_int) if pd.notna(raw_int) else 0.0)
 
+        if is_mix:
+            eff_int, mix_decomp = decompose_mixture_integral(
+                raw_int,
+                major_unit=major_unit,
+                minor_unit=minor_unit,
+                tol=0.06,
+            )
+            mixture_decompositions.append({
+                'ppm': float(ppm),
+                'raw_int': float(raw_int) if pd.notna(raw_int) else 0.0,
+                'eff_int': eff_int,
+                **mix_decomp,
+            })
+        else:
+            eff_int = float(raw_int) if pd.notna(raw_int) else 0.0
+        
         # Midfield 4-state classification (4.3-5.5 ppm)
         if 4.3 <= ppm <= 5.5:
             # State 4: Solvent-obscured peak (Solvent_Overlap == 1 and N_J == 0)
@@ -366,6 +558,8 @@ def extract_spectroscopic_features(compound_df):
         'methoxy_peaks': methoxy_peaks,
         'solvent_obscured_peaks': solvent_obscured_peaks,
         'bypass_sugar_filter': bypass_sugar_filter,
+        'mixture_decompositions': mixture_decompositions,
+        'clean_unit_info': clean_unit_info,
     }
     return domain_vec, domain_info
 
@@ -1163,9 +1357,27 @@ if uploaded_file is not None:
     df_new['Solvent_Overlap'] = df_new['Solvent_Overlap'].fillna(0) if 'Solvent_Overlap' in df_new.columns else 0
     df_new['Mixture_Overlap'] = df_new['Mixture_Overlap'].fillna(0) if 'Mixture_Overlap' in df_new.columns else 0
 
-    compounds_dict = deconvolve_excel_mixture(df_new, tol=0.15)
+    major_val, minor_val, clean_unit_info = extract_component_units_from_clean_peaks(df_new)
+    major_df, minor_df = split_mixture_df_by_components(
+        df_new,
+        major_val=major_val,
+        minor_val=minor_val,
+        tol=0.06,
+    )
+
+    compounds_dict = {}
+    if not major_df.empty:
+        maj_label = f"Major (unit ~{major_val:.2f})" if major_val is not None else "Major"
+        compounds_dict[maj_label] = major_df
+    if minor_val is not None and not minor_df.empty:
+        min_label = f"Minor (unit ~{minor_val:.2f})"
+        compounds_dict[min_label] = minor_df
+
     if len(compounds_dict) > 1:
-        st.info(f"Mixture detected: separated into {len(compounds_dict)} components ({', '.join(compounds_dict.keys())}).")
+        st.info(
+            f"Mixture detected from clean peaks {clean_unit_info.get('clusters', [])}: "
+            f"separated into {len(compounds_dict)} components ({', '.join(compounds_dict.keys())})."
+        )
 
     for cid, compound_df in compounds_dict.items():
         st.divider()
